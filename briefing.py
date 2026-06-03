@@ -1,9 +1,5 @@
 """
 포트폴리오 데일리 브리핑 자동화 스크립트
-- pykrx: 국내 주식 (삼성전자, 현대자동차)
-- yfinance: 미국 주식 (NVIDIA, Tesla)
-- Anthropic API: 최신 뉴스 수집 및 브리핑 생성
-- Gmail SMTP: 풀 브리핑 이메일 발송
 """
 
 import os
@@ -72,9 +68,8 @@ def fetch_prices() -> dict:
     return prices
 
 
-# ── 2. 뉴스 검색 (Anthropic API, web_search 없이) ────────
-def fetch_news_text(prices: dict) -> str:
-    """웹 검색 없이 Claude에게 주가 기반 브리핑 HTML 생성 요청"""
+# ── 2. 브리핑 HTML 생성 ───────────────────────────────────
+def fetch_briefing(prices: dict) -> dict:
     price_summary = "\n".join(
         f"- {name}: {info.get('price','N/A')}{info.get('currency','')} "
         f"({'+' if info.get('change_pct',0)>=0 else ''}{info.get('change_pct','?')}%) "
@@ -89,42 +84,50 @@ def fetch_news_text(prices: dict) -> str:
 {price_summary}
 
 위 주가 데이터를 바탕으로 포트폴리오 데일리 브리핑 이메일을 작성해주세요.
-
-반드시 아래 JSON 형식만 반환하세요 (```json 코드블록 없이 순수 JSON만):
+반드시 아래 JSON 형식만 반환하세요 (코드블록 없이 순수 JSON만):
 
 {{
   "email_subject": "[포트폴리오 브리핑] {today_str}",
-  "email_html": "인라인 CSS가 포함된 완성된 HTML 이메일. 다음 내용 포함: 1) 제목/날짜 헤더 2) 4개 종목 종가 요약 테이블(종목명, 현재가, 등락률, 시가/고가/저가) 3) 각 종목별 시장 분석 코멘트 2~3줄 4) 투자 유의사항 footer. 배경색 #f5f5f5, 카드 스타일, 상승은 초록색 하락은 빨간색으로 표시. 한국어로 작성."
+  "email_html": "인라인 CSS 포함 완성 HTML. 4개 종목 종가 테이블 + 종목별 분석 코멘트 포함. 상승 초록 하락 빨강. 한국어."
 }}"""
+
+    payload = {
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 4096,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+
+    print(f"🔑 API Key 앞 10자리: {ANTHROPIC_API_KEY[:10]}...")
+    print(f"📦 요청 payload 확인: model={payload['model']}, max_tokens={payload['max_tokens']}")
 
     response = requests.post(
         "https://api.anthropic.com/v1/messages",
-        headers={
-            "x-api-key": ANTHROPIC_API_KEY,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-        json={
-            "model": "claude-sonnet-4-20250514",
-            "max_tokens": 4096,
-            "messages": [{"role": "user", "content": prompt}],
-        },
+        headers=headers,
+        json=payload,
         timeout=120,
     )
-    response.raise_for_status()
-    data = response.json()
 
+    # 오류 시 응답 본문 출력
+    if response.status_code != 200:
+        print(f"❌ API 오류 상태코드: {response.status_code}")
+        print(f"❌ API 오류 응답: {response.text}")
+        response.raise_for_status()
+
+    data = response.json()
     full_text = "".join(
         block["text"] for block in data["content"] if block["type"] == "text"
     ).strip()
 
     # 코드블록 제거
     if "```" in full_text:
-        parts = full_text.split("```")
-        for part in parts:
-            part = part.strip()
-            if part.startswith("json"):
-                part = part[4:].strip()
+        for part in full_text.split("```"):
+            part = part.strip().lstrip("json").strip()
             if part.startswith("{"):
                 full_text = part
                 break
@@ -153,7 +156,7 @@ def main():
     print("prices:", json.dumps(prices, ensure_ascii=False, indent=2))
 
     print("🤖 브리핑 HTML 생성 중...")
-    briefing = fetch_news_text(prices)
+    briefing = fetch_briefing(prices)
 
     print("📧 Gmail 전송 중...")
     send_email(briefing["email_subject"], briefing["email_html"])

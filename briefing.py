@@ -2,7 +2,7 @@
 포트폴리오 데일리 브리핑 자동화 스크립트
 - pykrx: 국내 주식 (삼성전자, 현대자동차)
 - yfinance: 미국 주식 (NVIDIA, Tesla)
-- Anthropic API (web_search): 최신 뉴스 수집 및 브리핑 생성
+- Anthropic API: 최신 뉴스 수집 및 브리핑 생성
 - Gmail SMTP: 풀 브리핑 이메일 발송
 """
 
@@ -20,19 +20,17 @@ import yfinance as yf
 
 # ── 환경변수 ──────────────────────────────────────────────
 ANTHROPIC_API_KEY  = os.environ["ANTHROPIC_API_KEY"]
-GMAIL_USER         = os.environ["GMAIL_USER"]          # 발신 Gmail 주소
-GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]  # Gmail 앱 비밀번호
-RECIPIENT_EMAIL    = os.environ["RECIPIENT_EMAIL"]     # 수신 이메일 주소
+GMAIL_USER         = os.environ["GMAIL_USER"]
+GMAIL_APP_PASSWORD = os.environ["GMAIL_APP_PASSWORD"]
+RECIPIENT_EMAIL    = os.environ["RECIPIENT_EMAIL"]
 
 
 # ── 1. 주가 수집 ──────────────────────────────────────────
 def fetch_prices() -> dict:
     today = datetime.date.today().strftime("%Y%m%d")
     start = (datetime.date.today() - datetime.timedelta(days=7)).strftime("%Y%m%d")
-
     prices = {}
 
-    # 국내 주식 (pykrx)
     kr_stocks = {"삼성전자": "005930", "현대자동차": "005380"}
     for name, ticker in kr_stocks.items():
         try:
@@ -52,7 +50,6 @@ def fetch_prices() -> dict:
         except Exception as e:
             prices[name] = {"error": str(e)}
 
-    # 미국 주식 (yfinance)
     us_stocks = {"엔비디아": "NVDA", "테슬라": "TSLA"}
     for name, ticker in us_stocks.items():
         try:
@@ -75,31 +72,29 @@ def fetch_prices() -> dict:
     return prices
 
 
-# ── 2. Claude API로 뉴스 수집 + 브리핑 HTML 생성 ──────────
-def fetch_briefing(prices: dict) -> dict:
+# ── 2. 뉴스 검색 (Anthropic API, web_search 없이) ────────
+def fetch_news_text(prices: dict) -> str:
+    """웹 검색 없이 Claude에게 주가 기반 브리핑 HTML 생성 요청"""
     price_summary = "\n".join(
-        f"- {name}: {info.get('price', 'N/A')}{info.get('currency', '')} "
-        f"({'+' if info.get('change_pct', 0) >= 0 else ''}{info.get('change_pct', '?')}%)"
+        f"- {name}: {info.get('price','N/A')}{info.get('currency','')} "
+        f"({'+' if info.get('change_pct',0)>=0 else ''}{info.get('change_pct','?')}%) "
+        f"[{info.get('date','')}]"
         for name, info in prices.items()
     )
     today_str = datetime.date.today().strftime("%Y년 %m월 %d일")
 
     prompt = f"""오늘은 {today_str}입니다.
 
-[오늘 주가]
+[수집된 주가 데이터]
 {price_summary}
 
-아래 작업을 순서대로 수행해주세요.
+위 주가 데이터를 바탕으로 포트폴리오 데일리 브리핑 이메일을 작성해주세요.
 
-1. 웹 검색으로 다음 종목의 오늘 최신 뉴스를 각 2~3건씩 수집하세요:
-   삼성전자(005930), 현대자동차(005380), NVIDIA(NVDA), Tesla(TSLA)
-   영어 뉴스는 반드시 한국어로 번역하세요.
-
-2. 수집한 내용을 바탕으로 아래 JSON을 JSON만 반환하세요 (마크다운 코드블록 없이):
+반드시 아래 JSON 형식만 반환하세요 (```json 코드블록 없이 순수 JSON만):
 
 {{
-  "email_subject": "이메일 제목 (예: [포트폴리오 브리핑] 2026.06.03)",
-  "email_html": "종가 요약 테이블 + 종목별 뉴스 2~3건을 포함한 풀 브리핑 HTML. 인라인 CSS로 깔끔하게 스타일링. 한국어로 작성."
+  "email_subject": "[포트폴리오 브리핑] {today_str}",
+  "email_html": "인라인 CSS가 포함된 완성된 HTML 이메일. 다음 내용 포함: 1) 제목/날짜 헤더 2) 4개 종목 종가 요약 테이블(종목명, 현재가, 등락률, 시가/고가/저가) 3) 각 종목별 시장 분석 코멘트 2~3줄 4) 투자 유의사항 footer. 배경색 #f5f5f5, 카드 스타일, 상승은 초록색 하락은 빨간색으로 표시. 한국어로 작성."
 }}"""
 
     response = requests.post(
@@ -112,7 +107,6 @@ def fetch_briefing(prices: dict) -> dict:
         json={
             "model": "claude-sonnet-4-20250514",
             "max_tokens": 4096,
-            "tools": [{"type": "web_search_20250305", "name": "web_search"}],
             "messages": [{"role": "user", "content": prompt}],
         },
         timeout=120,
@@ -122,15 +116,20 @@ def fetch_briefing(prices: dict) -> dict:
 
     full_text = "".join(
         block["text"] for block in data["content"] if block["type"] == "text"
-    )
+    ).strip()
 
-    full_text = full_text.strip()
-    if full_text.startswith("```"):
-        full_text = full_text.split("```")[1]
-        if full_text.startswith("json"):
-            full_text = full_text[4:]
+    # 코드블록 제거
+    if "```" in full_text:
+        parts = full_text.split("```")
+        for part in parts:
+            part = part.strip()
+            if part.startswith("json"):
+                part = part[4:].strip()
+            if part.startswith("{"):
+                full_text = part
+                break
 
-    return json.loads(full_text.strip())
+    return json.loads(full_text)
 
 
 # ── 3. Gmail 발송 ─────────────────────────────────────────
@@ -153,8 +152,8 @@ def main():
     prices = fetch_prices()
     print("prices:", json.dumps(prices, ensure_ascii=False, indent=2))
 
-    print("🤖 Claude 브리핑 생성 중...")
-    briefing = fetch_briefing(prices)
+    print("🤖 브리핑 HTML 생성 중...")
+    briefing = fetch_news_text(prices)
 
     print("📧 Gmail 전송 중...")
     send_email(briefing["email_subject"], briefing["email_html"])
